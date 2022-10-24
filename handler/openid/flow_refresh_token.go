@@ -1,0 +1,123 @@
+/*
+ * Copyright © 2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * @author		Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @copyright 	2015-2018 Aeneas Rekkas <aeneas+oss@aeneas.io>
+ * @license 	Apache-2.0
+ *
+ */
+
+package openid
+
+import (
+	"context"
+	"time"
+
+	"github.com/pborman/uuid"
+
+	"github.com/ory/x/errorsx"
+
+	"github.com/pkg/errors"
+
+	"github.com/ory/fosite"
+)
+
+type OpenIDConnectRefreshHandler struct {
+	*IDTokenHandleHelper
+}
+
+func (c *OpenIDConnectRefreshHandler) HandleTokenEndpointRequest(ctx context.Context, request fosite.AccessRequester) error {
+	if !c.CanHandleTokenEndpointRequest(request) {
+		return errorsx.WithStack(fosite.ErrUnknownRequest)
+	}
+
+	if !request.GetGrantedScopes().Has("openid") {
+		return errorsx.WithStack(fosite.ErrUnknownRequest)
+	}
+
+	if !request.GetClient().GetGrantTypes().Has("refresh_token") {
+		return errorsx.WithStack(fosite.ErrUnauthorizedClient.WithHint("The OAuth 2.0 Client is not allowed to use the authorization grant \"refresh_token\"."))
+	}
+
+	// Refresh tokens can only be issued by an authorize_code which in turn disables the need to check if the id_token
+	// response type is enabled by the client.
+	//
+	// if !request.GetClient().GetResponseTypes().Has("id_token") {
+	// 	return errorsx.WithStack(fosite.ErrUnknownRequest.WithDebug("The client is not allowed to use response type id_token"))
+	// }
+
+	sess, ok := request.GetSession().(Session)
+	if !ok {
+		return errors.New("Failed to generate id token because session must be of type fosite/handler/openid.Session")
+	}
+
+	// We need to reset the expires at value as this would be the previous expiry.
+	sess.IDTokenClaims().ExpiresAt = time.Time{}
+
+	// These will be recomputed in PopulateTokenEndpointResponse
+	sess.IDTokenClaims().JTI = ""
+	sess.IDTokenClaims().AccessTokenHash = ""
+
+	// We are not issuing a code so there is no need for this field.
+	sess.IDTokenClaims().CodeHash = ""
+
+	return nil
+}
+
+func (c *OpenIDConnectRefreshHandler) PopulateTokenEndpointResponse(ctx context.Context, requester fosite.AccessRequester, responder fosite.AccessResponder) error {
+	if !c.CanHandleTokenEndpointRequest(requester) {
+		return errorsx.WithStack(fosite.ErrUnknownRequest)
+	}
+
+	if !requester.GetGrantedScopes().Has("openid") {
+		return errorsx.WithStack(fosite.ErrUnknownRequest)
+	}
+
+	if !requester.GetClient().GetGrantTypes().Has("refresh_token") {
+		return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint("The OAuth 2.0 Client is not allowed to use the authorization grant \"refresh_token\"."))
+	}
+
+	// Disabled because this is already handled at the authorize_request_handler
+	// if !requester.GetClient().GetResponseTypes().Has("id_token") {
+	// 	 return errorsx.WithStack(fosite.ErrUnknownRequest.WithDebug("The client is not allowed to use response type id_token"))
+	// }
+
+	sess, ok := requester.GetSession().(Session)
+	if !ok {
+		return errorsx.WithStack(fosite.ErrServerError.WithDebug("Failed to generate id token because session must be of type fosite/handler/openid.Session."))
+	}
+
+	claims := sess.IDTokenClaims()
+	if claims.Subject == "" {
+		return errorsx.WithStack(fosite.ErrServerError.WithDebug("Failed to generate id token because subject is an empty string."))
+	}
+
+	claims.AccessTokenHash = c.GetAccessTokenHash(ctx, requester, responder)
+	claims.JTI = uuid.New()
+	claims.CodeHash = ""
+	claims.IssuedAt = time.Now().Truncate(time.Second)
+
+	return c.IssueExplicitIDToken(ctx, requester, responder)
+}
+
+func (c *OpenIDConnectRefreshHandler) CanSkipClientAuth(requester fosite.AccessRequester) bool {
+	return false
+}
+
+func (c *OpenIDConnectRefreshHandler) CanHandleTokenEndpointRequest(requester fosite.AccessRequester) bool {
+	// grant_type REQUIRED.
+	// Value MUST be set to "refresh_token"
+	return requester.GetGrantTypes().ExactOne("refresh_token")
+}
